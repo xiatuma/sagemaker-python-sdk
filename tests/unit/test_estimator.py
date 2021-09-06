@@ -3310,7 +3310,7 @@ def test_estimator_local_mode_ok(sagemaker_local_session):
     )
 
 
-def test_framework_distribution_configuration(sagemaker_session):
+def test_framework_distribution_configuration_twice(sagemaker_session):
     framework = DummyFramework(
         entry_point="script",
         role=ROLE,
@@ -3339,7 +3339,7 @@ def test_framework_distribution_configuration(sagemaker_session):
     assert actual_ddp == expected_ddp
 
 
-def test_image_name_map(sagemaker_session):
+def test_image_name_map_twice(sagemaker_session):
     e = DummyFramework(
         "my_script.py",
         image_name=IMAGE_URI,
@@ -3350,3 +3350,297 @@ def test_image_name_map(sagemaker_session):
     )
 
     assert e.image_uri == IMAGE_URI
+
+
+
+def test_framework_with_debugger_and_built_in_rule_twice(sagemaker_session):
+    debugger_built_in_rule_with_custom_args = Rule.sagemaker(
+        base_config=rule_configs.stalled_training_rule(),
+        rule_parameters={"threshold": "120", "stop_training_on_fire": "True"},
+        collections_to_save=[
+            CollectionConfig(
+                name="losses", parameters={"train.save_interval": "50", "eval.save_interval": "10"}
+            )
+        ],
+    )
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[debugger_built_in_rule_with_custom_args],
+        debugger_hook_config=DebuggerHookConfig(s3_output_path="s3://output"),
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"][0]["RuleParameters"] == {
+        "rule_to_invoke": "StalledTrainingRule",
+        "threshold": "120",
+        "stop_training_on_fire": "True",
+    }
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://output",
+        "CollectionConfigurations": [
+            {
+                "CollectionName": "losses",
+                "CollectionParameters": {"train.save_interval": "50", "eval.save_interval": "10"},
+            }
+        ],
+    }
+    assert args["profiler_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+    }
+
+
+def test_framework_with_debugger_and_custom_rule_twice(sagemaker_session):
+    hook_config = DebuggerHookConfig(
+        s3_output_path="s3://output", collection_configs=[CollectionConfig(name="weights")]
+    )
+    debugger_custom_rule = Rule.custom(
+        name="CustomRule",
+        image_uri="RuleImageUri",
+        instance_type=INSTANCE_TYPE,
+        volume_size_in_gb=5,
+        source="path/to/my_custom_rule.py",
+        rule_to_invoke="CustomRule",
+        other_trials_s3_input_paths=["s3://path/trial1", "s3://path/trial2"],
+        rule_parameters={"threshold": "120"},
+    )
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[debugger_custom_rule],
+        debugger_hook_config=hook_config,
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"] == [
+        {
+            "RuleConfigurationName": "CustomRule",
+            "RuleEvaluatorImage": "RuleImageUri",
+            "InstanceType": INSTANCE_TYPE,
+            "VolumeSizeInGB": 5,
+            "RuleParameters": {
+                "source_s3_uri": sagemaker_session.upload_data(),
+                "rule_to_invoke": "CustomRule",
+                "threshold": "120",
+                "other_trial_0": "s3://path/trial1",
+                "other_trial_1": "s3://path/trial2",
+            },
+        }
+    ]
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://output",
+        "CollectionConfigurations": [{"CollectionName": "weights"}],
+    }
+
+
+def test_framework_with_only_debugger_rule_twice(sagemaker_session):
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[Rule.sagemaker(rule_configs.stalled_training_rule())],
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"][0]["RuleParameters"] == {
+        "rule_to_invoke": "StalledTrainingRule"
+    }
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+        "CollectionConfigurations": [],
+    }
+
+
+def test_framework_with_debugger_rule_and_single_action_twice(sagemaker_session):
+    stop_training_action = rule_configs.StopTraining()
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[Rule.sagemaker(rule_configs.stalled_training_rule(), actions=stop_training_action)],
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"][0]["RuleParameters"] == {
+        "rule_to_invoke": "StalledTrainingRule",
+        "action_json": stop_training_action.serialize(),
+    }
+    assert stop_training_action.action_parameters["training_job_prefix"] == f._current_job_name
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+        "CollectionConfigurations": [],
+    }
+
+
+def test_framework_with_debugger_rule_and_multiple_actions_twice(sagemaker_session):
+    action_list = rule_configs.ActionList(
+        rule_configs.StopTraining(),
+        rule_configs.Email("abc@abc.com"),
+        rule_configs.SMS("+1234567890"),
+    )
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[Rule.sagemaker(rule_configs.stalled_training_rule(), actions=action_list)],
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"][0]["RuleParameters"] == {
+        "rule_to_invoke": "StalledTrainingRule",
+        "action_json": action_list.serialize(),
+    }
+    assert action_list.actions[0].action_parameters["training_job_prefix"] == f._current_job_name
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+        "CollectionConfigurations": [],
+    }
+
+
+def test_framework_with_only_debugger_hook_config_twice(sagemaker_session):
+    hook_config = DebuggerHookConfig(
+        s3_output_path="s3://output", collection_configs=[CollectionConfig(name="weights")]
+    )
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        debugger_hook_config=hook_config,
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://output",
+        "CollectionConfigurations": [{"CollectionName": "weights"}],
+    }
+    assert "debugger_rule_configs" not in args
+
+
+@patch("time.time", return_value=TIME)
+def test_framework_without_debugger_and_profiler_twice(time, sagemaker_session):
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_hook_config"] == {
+        "CollectionConfigurations": [],
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+    }
+    assert "debugger_rule_configs" not in args
+    assert args["profiler_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+    }
+    assert args["profiler_rule_configs"] == [
+        {
+            "RuleConfigurationName": "ProfilerReport-1510006209",
+            "RuleEvaluatorImage": "895741380848.dkr.ecr.us-west-2.amazonaws.com/sagemaker-debugger-rules:latest",
+            "RuleParameters": {"rule_to_invoke": "ProfilerReport"},
+        }
+    ]
+
+
+def test_framework_with_debugger_and_profiler_rules_twice(sagemaker_session):
+    debugger_built_in_rule_with_custom_args = Rule.sagemaker(
+        base_config=rule_configs.stalled_training_rule(),
+        rule_parameters={"threshold": "120", "stop_training_on_fire": "True"},
+        collections_to_save=[
+            CollectionConfig(
+                name="losses", parameters={"train.save_interval": "50", "eval.save_interval": "10"}
+            )
+        ],
+    )
+    profiler_built_in_rule_with_custom_args = ProfilerRule.sagemaker(
+        base_config=rule_configs.ProfilerReport(CPUBottleneck_threshold=90),
+        name="CustomProfilerReportRule",
+    )
+    profiler_custom_rule = ProfilerRule.custom(
+        name="CustomProfilerRule",
+        image_uri="RuleImageUri",
+        instance_type=INSTANCE_TYPE,
+        volume_size_in_gb=5,
+        source="path/to/my_custom_rule.py",
+        rule_to_invoke="CustomProfilerRule",
+        rule_parameters={"threshold": "10"},
+    )
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_count=INSTANCE_COUNT,
+        instance_type=INSTANCE_TYPE,
+        rules=[
+            debugger_built_in_rule_with_custom_args,
+            profiler_built_in_rule_with_custom_args,
+            profiler_custom_rule,
+        ],
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["debugger_rule_configs"] == [
+        {
+            "RuleConfigurationName": "StalledTrainingRule",
+            "RuleEvaluatorImage": "895741380848.dkr.ecr.us-west-2.amazonaws.com/sagemaker-debugger-rules:latest",
+            "RuleParameters": {
+                "rule_to_invoke": "StalledTrainingRule",
+                "threshold": "120",
+                "stop_training_on_fire": "True",
+            },
+        }
+    ]
+    assert args["debugger_hook_config"] == {
+        "S3OutputPath": "s3://mybucket/",
+        "CollectionConfigurations": [
+            {
+                "CollectionName": "losses",
+                "CollectionParameters": {"train.save_interval": "50", "eval.save_interval": "10"},
+            }
+        ],
+    }
+    assert args["profiler_config"] == {
+        "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
+    }
+    assert args["profiler_rule_configs"] == [
+        {
+            "RuleConfigurationName": "CustomProfilerReportRule",
+            "RuleEvaluatorImage": "895741380848.dkr.ecr.us-west-2.amazonaws.com/sagemaker-debugger-rules:latest",
+            "RuleParameters": {"rule_to_invoke": "ProfilerReport", "CPUBottleneck_threshold": "90"},
+        },
+        {
+            "InstanceType": "c4.4xlarge",
+            "RuleConfigurationName": "CustomProfilerRule",
+            "RuleEvaluatorImage": "RuleImageUri",
+            "RuleParameters": {
+                "rule_to_invoke": "CustomProfilerRule",
+                "source_s3_uri": OUTPUT_PATH,
+                "threshold": "10",
+            },
+            "VolumeSizeInGB": 5,
+        },
+    ]
